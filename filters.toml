@@ -1,0 +1,41 @@
+# パイプライン挙動・閾値の一元管理 (デフォルトは src/make_dataset/config.py の DEFAULTS)
+# ここでキーを変えるだけで再生成なしに挙動変更できることが設計上のポイント。
+
+[output]
+sample_rate = 44100
+channels = 1
+target_lufs = -23.0
+
+[stage1]
+speech_pad_ms = 70
+refine_window_ms = 70
+min_seg_sec = 0.6
+max_seg_sec = 30.0
+
+[asr]
+backend = "faster-whisper"  # または "qwen3-asr" (その場合 model は HF リポジトリID、例: "Qwen/Qwen3-ASR-1.7B-hf")
+model = "small"        # faster-whisper 時はサイズ名。Qwen3-ASR 等はここに差し替え
+compute_type = "int8"
+device = "cpu"
+language = "ja"
+beam_size = 1
+
+[thresholds]
+# 既定値は test/asset/haruka_ran_nobgm の実測分布で校正済み。キーを消せば該当チェックは無効化される
+min_snr_db = 5.0
+min_asr_conf = 0.30
+min_align_conf = 0.30
+min_mora_rate = 2.0
+max_mora_rate = 14.0
+min_hf_energy_ratio = 0.0005   # 7kHz 以上エネルギー比 (16k/24k アップコン見せかけ品質の検出。実測 p5≈0.001)
+# min_rolloff_hz = 7500.0      # ロールオフ単体は音量の低い文で誤爆するためゲート既定値なし
+max_reverb_score = 0.5
+min_quality_pesq = 1.0
+min_chars = 4
+max_filler_ratio = 0.8
+max_jitter_local = 0.5         # F0 摂動プロキシ。praat 実 jitter への差し替え時に 0.02 程度へ
+# max_shimmer_local = 0.30     # プロキシ未整備のためデフォルト無効
+
+[dedup]
+text_jaccard = 0.92
+phoneme_jaccard = 0.90

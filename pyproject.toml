@@ -1,0 +1,47 @@
+[project]
+name = "style-bert-vits2-dataset"
+version = "0.1.0"
+description = "Style-Bert-VITS2-Train 用データセット全自動生成パイプライン (docs/DESIGN.md 実装ドラフト)"
+requires-python = ">=3.12"
+dependencies = [
+    "typer",
+    "numpy",
+    "scipy",
+    "soundfile",
+    "torch>=2.7",
+    "torchaudio>=2.7",
+    "silero-vad",
+    "faster-whisper",
+    "pyopenjtalk-plus",
+    "praat-parselmouth",
+    "pyloudnorm",
+    "transformers>=5.13",
+    "accelerate>=1.15.0",
+    "librosa>=1.0.0",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchaudio = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv]
+
+[project.scripts]
+make_dataset = "make_dataset.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/make_dataset"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
