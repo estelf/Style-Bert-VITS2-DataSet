@@ -1,51 +1,56 @@
-"""filters.toml 読み込み. 閾値とパイプライン挙動設定を一元管理する (設計原則: フィルタロジックと閾値設定の分離)."""
+"""filters.toml 読み込み. 閾値とパイプライン挙動設定を一元管理する (設計原則: フィルタロジックと閾値設定の分離).
+
+E2 対応の設計: 「キーを消せば無効化される」を本当に成立させるため、閾値 (thresholds) に
+コード側デフォルトを持たせない。全閾値は filters.toml に明示され、キーが無ければ該当チェックは走らない。
+TOML には None を書けないので、「キー自体を消す = 無効」が唯一の無効化手段であることが保証される。
+パイプライン挙動 (stage1/asr/dedup の一部) は DEFAULTS に持ってよい (閾値ではなく動作パラメータ)。
+"""
 
 from __future__ import annotations
 
 import tomllib
 from pathlib import Path
+from typing import Any
 
 DEFAULTS = {
+    "paths": {
+        # `make_dataset run <話者名>` が音声を取りに行くルート。voice/<話者名>/ にフラット配置する
+        "voice": "voice",
+    },
     "output": {"sample_rate": 44100, "channels": 1, "target_lufs": -23.0},
     "stage1": {
-        "speech_pad_ms": 70,      # VAD パディング
-        "refine_window_ms": 70,   # 強制アライメント代替の境界補正窓 (語尾切れ/先端ノイズ対策)
-        "min_seg_sec": 0.6,
-        "max_seg_sec": 30.0,
+        # D4: silero-vad の主要パラメータを露出する。「1行=1文」契約を左右するのは speech_pad_ms よりこちら側。
+        "vad_threshold": 0.5,
+        "min_silence_duration_ms": 200,
+        "min_speech_duration_ms": 250,
+        "max_speech_duration_s": 15.0,  # D3: 長い塊を VAD 側で分割し、seg_dur で捨てない (DESIGN「2文混入の自動分割」)
+        "speech_pad_ms": 0,  # C11: 既定は無音パディングなし (出力は音声境界そのまま。ASR に文脈が欲しい時だけ上げる)
+        "refine_window_ms": 70,  # 強制アライメント代替の境界補正窓 (語尾切れ/先端ノイズ対策、C8 で side 考慮)
+        "min_seg_sec": 0.5,  # これより短い VAD 出力はスキップ (閾値ゲート [thresholds].min_seg_sec と揃える)
+    },
+    "runtime": {
+        "device": "auto",  # "auto" / "cpu" / "cuda"。Qwen3-ASR・SQUIM 等の torch 推論が従う (docs/GPU.md)
     },
     "asr": {
-        "backend": "faster-whisper",  # または "qwen3-asr" (model には HF リポジトリID を入れる)
+        "backend": "faster-whisper",  # filters.toml の既定は "qwen3-asr"。こちらはコード側の安全側フォールバック (CPU 軽量)
         "model": "small",
-        "compute_type": "int8",
-        "device": "cpu",
+        "compute_type": "int8",  # faster-whisper のみ。cuda では float16 へ自動切替 (int8 は CPU 量子化)
+        "device": "auto",  # "auto" なら runtime.device に従う
         "language": "ja",
         "beam_size": 1,
+        "batch_size": 8,  # F5: デコード窓のバッチ (faster-whisper の並列デコード)
     },
-    "thresholds": {
-        # すべて「記録済みスコアに対する閾値」。欠損キーなら該当チェックはスキップ。
-        # 既定値は test/asset/haruka_ran_nobgm の実測分布で校正済み (p5 をやや下回るあたり)。
-        "min_snr_db": 5.0,
-        "min_asr_conf": 0.30,
-        "min_align_conf": 0.30,
-        "min_mora_rate": 2.0,
-        "max_mora_rate": 14.0,
-        "min_hf_energy_ratio": 0.0005,  # 7kHz 以上エネルギー比。16k/24k アップコン見せかけ品質の検出 (実測 p5≈0.001)
-        "min_rolloff_hz": None,         # ロールオフ単体は音量の低い文で誤爆するためゲート既定値なし
-        "max_reverb_score": 0.5,    # ドラフトでは簡易プロキシ。無効化したいならキーを削除
-        "min_quality_pesq": 1.0,    # SQUIM PESQ (1-4.5)。ドラフトでは緩めに通し、レポートで分布確認
-        "min_chars": 4,
-        "max_filler_ratio": 0.8,
-        "max_jitter_local": 0.5,    # F0 摂動プロキシ。praat 本来の jitter へ差し替え時に 0.02 程度へ締める
-        "max_shimmer_local": None,  # プロキシ未整備のためデフォルト無効
-    },
+    # E2: thresholds に hidden default は置かない。filters.toml が唯一の閾値ソース。
+    "thresholds": {},
     "dedup": {
-        "text_jaccard": 0.92,       # テキストファジィ (shingle Jaccard)
-        "phoneme_jaccard": 0.90,    # 音素三量文字列 Jaccard
+        "text_jaccard": 0.92,  # テキストファジィ (shingle Jaccard)
+        "phoneme_jaccard": 0.90,  # 音素三量文字列 Jaccard
+        "audio_jaccard": 0.5,  # D8: 音声内容指紋 (fp_sig MinHash 一致率) によるズレ切り出し重複検出
     },
 }
 
 
-def _merge(base: dict, over: dict) -> dict:
+def _merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
     out = dict(base)
     for k, v in over.items():
         out[k] = _merge(base[k], v) if isinstance(v, dict) and isinstance(base.get(k), dict) else v
@@ -53,21 +58,37 @@ def _merge(base: dict, over: dict) -> dict:
 
 
 class Config:
-    """filters.toml + デフォルト の差分設定。点記号でスコア閾値を参照できる。"""
+    """filters.toml + デフォルト の差分設定。点記号で挙動パラメータを参照できる。"""
 
-    def __init__(self, data: dict):
-        self.data = _merge(DEFAULTS, data)
+    def __init__(self, data: dict[str, Any]) -> None:
+        self.data: dict[str, Any] = _merge(DEFAULTS, data)
 
     @classmethod
-    def load(cls, path: Path | None = None) -> "Config":
-        data = {}
+    def load(cls, path: Path | None = None) -> Config:
+        data: dict[str, Any] = {}
         if path is not None and Path(path).exists():
             with open(path, "rb") as f:
                 data = tomllib.load(f)
         return cls(data)
 
-    def get(self, dotted: str):
+    def get(self, dotted: str) -> Any:
+        """点記号参照。TOML 由来の値は型が一律に決まらないので Any (閾値は float、パスは str 等)."""
         cur = self.data
         for key in dotted.split("."):
             cur = cur[key]
         return cur
+
+    @property
+    def thresholds(self) -> dict[str, Any]:
+        """閾値テーブル (キーが存在しない = そのチェックは無効)。"""
+        return self.data["thresholds"]
+
+
+def resolve_device(cfg: Config) -> str:
+    """runtime.device ("auto"/"cpu"/"cuda") を実デバイス名へ解決する。auto は CUDA があれば cuda。"""
+    dev = cfg.get("runtime.device")
+    if dev != "auto":
+        return dev
+    import torch
+
+    return "cuda" if torch.cuda.is_available() else "cpu"

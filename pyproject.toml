@@ -18,18 +18,21 @@ dependencies = [
     "transformers>=5.13",
     "accelerate>=1.15.0",
     "librosa>=1.0.0",
+    "tqdm",
 ]
 
+# F7: 既定は CPU wheel 固定 (pytorch-cpu index)。GPU で使う場合は下の index url を
+# https://download.pytorch.org/whl/cu128 などへ差し替えて `uv lock && uv sync` する
+# (torch を optional-dependencies へ分離すると既定の `uv sync` で torch が消えて壊れるため、
+#  index 差し替え手順を明示する形にしている)。
 [tool.uv.sources]
-torch = { index = "pytorch-cpu" }
-torchaudio = { index = "pytorch-cpu" }
+torch = { index = "pytorch-gpu" }
+torchaudio = { index = "pytorch-gpu" }
 
 [[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
+name = "pytorch-gpu"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true
-
-[tool.uv]
 
 [project.scripts]
 make_dataset = "make_dataset.cli:main"
@@ -43,5 +46,41 @@ build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [
+    "black>=26.5.1",
+    "pyright>=1.1.414",
     "pytest>=9.1.1",
+    "ruff>=0.16.8",
 ]
+
+[tool.pyright]
+include = ["src", "test"]
+typeCheckingMode = "standard"
+# uvx などで実行してもプロジェクトの .venv (3.12) を解決させる (既定検出の補強)
+venvPath = "."
+venv = ".venv"
+
+# 書式は black に一本化し、ruff はリント専用として使う (ruff format は使わない)。
+# 既定の広域ルールは select で選び直す: FURB / PLW などは本パイプラインの
+# 「任意依存の try/except フォールバック」で誤検知になるため入れない。
+# BLE は既存コードの `# noqa: BLE001` 指定に合わせて有効にし、意図した箇所だけ noqa で抑える。
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "test"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B", "SIM", "C4", "RUF", "BLE"]
+ignore = [
+    "E501",  # 行長は black 側で管理。日本語コメントや HTML 文字列は分割できないため無効化
+    "RUF001",  # 全角・「×」「｜」「–」などを英字と混同するため、日本語ドキュメントでは無効化
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# typer は Argument/Option を引数既定値に置くのが公式イディオム
+"src/make_dataset/cli.py" = ["B008"]
+
+[tool.black]
+line-length = 100
+target-version = ["py312"]

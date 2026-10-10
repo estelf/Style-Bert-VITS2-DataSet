@@ -1,41 +1,73 @@
-# パイプライン挙動・閾値の一元管理 (デフォルトは src/make_dataset/config.py の DEFAULTS)
+# パイプライン挙動・閾値の一元管理 (挙動パラメータのデフォルトは src/make_dataset/config.py の DEFAULTS)
 # ここでキーを変えるだけで再生成なしに挙動変更できることが設計上のポイント。
+# E2: 閾値にコード側デフォルトは無い。キーを消せば (またはコメント化すれば) 該当チェックは無効化される。
+#     閾値が有効なのにスコアが取得できない発話は「検証不能=不合格」になる。
+
+[paths]
+# `make_dataset run <話者名>` が音声を取りに行くルート。voice/<話者名>/ に音声・動画をフラット配置すると
+# 話者名と Data/<モデル名>/ がそのディレクトリ名から自動採用される (例: voice/speeker1/ → Data/speeker1/)
+voice = "voice"
 
 [output]
 sample_rate = 44100
 channels = 1
 target_lufs = -23.0
 
+[runtime]
+device = "auto"   # "auto" / "cpu" / "cuda"。Qwen3-ASR・SQUIM 等 torch 推論が従う (GPU 手順: docs/GPU.md)
+
 [stage1]
-speech_pad_ms = 70
-refine_window_ms = 70
-min_seg_sec = 0.6
-max_seg_sec = 30.0
+# D4: 「1行=1文」契約を左右するのは speech_pad_ms ではなく silero-vad 側のパラメータ
+vad_threshold = 0.5
+min_silence_duration_ms = 200
+min_speech_duration_ms = 250
+max_speech_duration_s = 12.0   # D3: 長い塊は破棄せず VAD 側で 12s で分割 (発話長ゲート <12s と揃える)
+speech_pad_ms = 0              # C11: 既定はパディングなし (出力は音声境界そのまま。ASR 文脈用に上げる場合のみ)
+refine_window_ms = 70          # 境界補正窓 (C8: 始端/終端それぞれ話声の実境界へ。語尾は切らない)
+min_seg_sec = 0.5              # これより短い VAD 出力はスキップ (閾値ゲート min_seg_sec と揃える)
 
 [asr]
-backend = "faster-whisper"  # または "qwen3-asr" (その場合 model は HF リポジトリID、例: "Qwen/Qwen3-ASR-1.7B-hf")
-model = "small"        # faster-whisper 時はサイズ名。Qwen3-ASR 等はここに差し替え
-compute_type = "int8"
-device = "cpu"
+backend = "qwen3-asr"  # 既定: Qwen3-ASR (高精度)。"faster-whisper" は CPU 軽量代替 (model は "small"/"tiny" 等のサイズ名)
+model = "Qwen/Qwen3-ASR-1.7B-hf"  # qwen3-asr 時は HF リポジトリID。faster-whisper 時は Whisper サイズ名
+compute_type = "int8"  # faster-whisper のみ。device が cuda のときは float16 へ自動切替
+device = "auto"        # "auto" なら runtime.device に従う
 language = "ja"
-beam_size = 1
+beam_size = 1          # faster-whisper のみ
+batch_size = 8         # faster-whisper のみ (対応版ならデコード窓のバッチ並列へ渡す)
 
 [thresholds]
-# 既定値は test/asset/haruka_ran_nobgm の実測分布で校正済み。キーを消せば該当チェックは無効化される
+# 既定値は test/asset/ の実測分布で校正済み (C6 で再校正)。キーを消せば該当チェックは無効化される。
+min_seg_sec = 0.5              # 発話長ゲート: 0.5 秒以上 (満たないものは除外)
+max_seg_sec = 12.0             # 発話長ゲート: 12 秒未満 (12.0 以上は除外。VAD 側も 12s で分割する)
 min_snr_db = 5.0
 min_asr_conf = 0.30
 min_align_conf = 0.30
 min_mora_rate = 2.0
 max_mora_rate = 14.0
+max_mora_rate_dev = 1.2        # C5: 話速の話者中央値からの相対乖離 (2文混入・ASR欠落・ガチャ)
 min_hf_energy_ratio = 0.0005   # 7kHz 以上エネルギー比 (16k/24k アップコン見せかけ品質の検出。実測 p5≈0.001)
 # min_rolloff_hz = 7500.0      # ロールオフ単体は音量の低い文で誤爆するためゲート既定値なし
 max_reverb_score = 0.5
-min_quality_pesq = 1.0
+min_quality_pesq = 1.5         # C6: 1.0 は PESQ スケールの下限値そのもので実質 no-op だった。実測分布を見て締める
 min_chars = 4
-max_filler_ratio = 0.8
-max_jitter_local = 0.5         # F0 摂動プロキシ。praat 実 jitter への差し替え時に 0.02 程度へ
-# max_shimmer_local = 0.30     # プロキシ未整備のためデフォルト無効
+max_filler_ratio = 0.6         # C6: 0.8 は甘すぎた
+max_jitter_local = 0.02        # C3 修正 (有声区間内の Praat local 定義) に合わせて 0.5 → 0.02
+# max_shimmer_local = 0.05     # C3 修正済み。実測分布を確認して有効化
+min_speaker_sim = 0.5          # C5: CMVN 済み埋め込みの centroid cosine (別人混入)。実測分布で要校正
+min_kana_ratio = 0.5           # C5: 日本語らしさ (英語・記号化テキストの検出)
+# min_f0_hz / max_f0_hz        # 話者依存の帯域なのでデータセットごとに設定する (例: min_f0_hz = 120.0)
+max_clip_ratio = 0.002         # D2: クリッピング率 (学習後に修復不可能)
+max_dc_offset = 0.02           # D2: DC オフセット絶対値
+# max_no_speech_prob = 0.8     # D1: 「無声区間だと ASR が言っている」= ハルシネーション (faster-whisper 専用スコア)。
+#                              #   qwen3-asr を使っている間に有効にすると欠損スコア=全件不合格になるので注意
+# max_compression_ratio = 2.4  # D1: 繰り返しガチャ (whisper 本体のしきい値と揃えた)。同上 faster-whisper 専用
+reject_repetition = true       # D1: 同一文言 3 連呼以上のブロック (バックエンド非依存で検出)
+reject_alpha_only = true       # E4: アルファベットのみ (filler_ratio とは別理由で記録)
+reject_music = true            # D5: ♪ 検出 = 音楽だと判定した発話
+on_g2p_fail = "exclude"        # E3: G2P が通らないテキストの扱い ("exclude" / "dict_data")
+on_unknown_tokens = "dict_data"  # E3: unknown トークンはユーザー辞書候補へ (status=pending_review でレポートに出る)
 
 [dedup]
 text_jaccard = 0.92
 phoneme_jaccard = 0.90
+audio_jaccard = 0.5            # D8: 音声内容指紋 (fp_sig MinHash 一致率)。ズレ切り出し重複は 0.6 前後、別発話は 0.2 未満
