@@ -8,7 +8,7 @@
 `voice/<トークン>` がカレントの同名ファイル・ディレクトリと衝突することはない
 (1 実行 = 1 話者分 = 同じディレクトリのファイル)。
 
-E1: `rescore` サブコマンドは manifest.jsonl と中間キャッシュ (.cache/) だけから、閾値変更で
+`rescore` サブコマンドは manifest.jsonl と中間キャッシュ (.cache/) だけから、閾値変更で
 採用/除外と納品物 (esd.list / raw.zip / report.html) を再生成する (DESIGN.md「閾値変更だけで再判定」)。
 """
 
@@ -21,12 +21,19 @@ import typer
 
 from .config import Config
 from .manifest import read_manifest, write_manifest
+from .overrides import apply_text_overrides
 from .stage0_ingest import ingest
 from .stage1_segment import segment_sources
-from .stage2_score import score_segments
-from .stage3_asr import flag_mora_rate_outliers, transcribe_segments
+from .stage2_score import recompute_speaker_sim, score_segments
+from .stage3_asr import (
+    flag_mora_rate_outliers,
+    refresh_asr2_scores,
+    refresh_text_tail_scores,
+    refresh_yomi_scores,
+    transcribe_segments,
+)
 from .stage4_quality import score_quality
-from .stage5_dedup import dedup
+from .stage5_dedup import dedup, diversity_select
 from .stage6_output import (
     evaluate_checks,
     finalize_statuses,
@@ -132,10 +139,56 @@ def resolve_inputs(tokens: list[str], voice_root: Path) -> list[Path]:
     return files
 
 
+# 有効なゲートに対してプロバイダ (スコアを記録する任意機能) がオフだと「検証不能=全件不合格」になる
+# もの。run 時にだけ警告する (rescore は過去ランの manifest スコアで正当に再判定できるため)。
+_GATE_PROVIDERS = {
+    "max_x_cer": "asr2.enabled",
+    "min_mos": "stage4.subjective",
+    "reject_audio_tags": "tags.enabled",
+    "min_ctc_align": "alignment.enabled",
+    "max_unaligned_edge": "alignment.enabled",
+    "max_lm_ppl": "lm.enabled",
+    "reject_overlap": "overlap.enabled",
+}
+
+
+def _warn_config(cfg: Config, mode: str = "run") -> None:
+    """設定の相互矛盾を起動時に警告する (黙って効かないゲートを作らない)."""
+    t = cfg.thresholds
+    cache_min = cfg.get("stage1.cache_min_sec")
+    lo = t.get("min_seg_sec")
+    if lo is not None and cache_min is not None and lo < cache_min:
+        typer.echo(
+            f"warning: [thresholds] min_seg_sec={lo} < [stage1] cache_min_sec={cache_min}。"
+            f" {cache_min}秒未満は Stage 1 でスキップ (音声キャッシュを作らない) ためこのゲートの下側は効かない"
+            f" (min_seg_sec を {cache_min} 以上に上げるか cache_min_sec を下げる)",
+            err=True,
+        )
+    if mode != "run":
+        return
+    for tkey, provider in _GATE_PROVIDERS.items():
+        if tkey in t and t[tkey] is not None and not cfg.get(provider):
+            sec, key = provider.split(".", 1)
+            typer.echo(
+                f"warning: [thresholds] {tkey} が有効だが [{sec}] {key} = false。"
+                f" このランではスコアが記録されず全件「検証不能=不合格」になる"
+                f" (既にスコアを持つ manifest への再判定なら rescore を使うこと)",
+                err=True,
+            )
+
+
 def _judge_and_write(records, cfg: Config, out: Path, speaker: str, cache: Path, mode: str):
-    """閾値評価 → 重複排除 → 確定 → 納品物書き出し (run と rescore で共通)."""
-    evaluate_checks(records, cfg)  # E4: 全失格理由を記録 (B5: dedup より先に)
-    dedup(records, cfg)  # B5: 閾値通過者から代表を選ぶ
+    """人手上書きの再適用 → 相関集計の再計算 → 閾値評価 → 重複排除 → 多様性選別 → 確定 → 書き出し."""
+    n_ov = apply_text_overrides(records, out, cfg)  # dedup・話速中央値より前に適用するのが重要
+    if n_ov:
+        typer.echo(f"[review] text_overrides.jsonl から {n_ov} 件の上書きを再適用")
+    recompute_speaker_sim(
+        records
+    )  # C: 主話者 centroid を頑健サブセットから (emb があるので rescore でも最新化)
+    flag_mora_rate_outliers(records)  # C: 話速中央値もクリーンな発話だけで再計算
+    evaluate_checks(records, cfg)  # 全失格理由を記録 (dedup より先に)
+    dedup(records, cfg)  # 閾値通過者から代表を選ぶ
+    diversity_select(records, cfg)  # 多様性選別: 重複排除後の候補から「既採用と類似すぎ」を落とす
     finalize_statuses(records)
 
     adopted = [r for r in records if r.status == "adopted"]
@@ -152,7 +205,10 @@ def _judge_and_write(records, cfg: Config, out: Path, speaker: str, cache: Path,
         typer.echo(f"  excluded by {k}: {v}")
     n_pending = sum(1 for r in records if r.status == "pending_review")
     if n_pending:
-        typer.echo(f"  pending_review (ユーザー辞書候補等): {n_pending}")
+        typer.echo(
+            f"  pending_review (納品しない見送り: ユーザー辞書候補・修復音声等): {n_pending}"
+            f" → report.html の「見送り」一覧。確定するなら text_overrides.jsonl に status を書いて rescore"
+        )
 
 
 @app.command()
@@ -172,9 +228,10 @@ def run(
     outdir: str = typer.Option("Data", "--outdir", help="出力ルート (Data/<モデル名>/ に書く)"),
 ):
     cfg = Config.load(Path(config))
+    _warn_config(cfg, "run")
     paths = resolve_inputs(inputs, Path(cfg.get("paths.voice")))
     typer.echo(f"[input] {paths[0].resolve().parent} から {len(paths)} ファイル")
-    # A5: カレントの素文件名 (Path("clip.mp3").parent.name == "") でも話者名が空にならない
+    # カレントの素文件名 (Path("clip.mp3").parent.name == "") でも話者名が空にならない
     model_name = model_name or paths[0].resolve().parent.name
     speaker = speaker or model_name
 
@@ -184,13 +241,19 @@ def run(
         typer.echo(f"  skip {path.name}: {why}")
 
     out = Path(outdir) / model_name
-    cache = out / ".cache"  # A3/E1: 中間キャッシュと納品用 raw/ を分離
+    cache = out / ".cache"  # 中間キャッシュと納品用 raw/ を分離
     records = segment_sources(sources, cfg, cache)
     typer.echo(f"[stage1] segments={len(records)}")
     score_segments(records, cfg, cache)
     transcribe_segments(records, cfg, cache)
-    flag_mora_rate_outliers(records)
     score_quality(records, cfg, cache)
+    if cfg.get(
+        "repair.enabled"
+    ):  # ノイズ系ゲート単独落ちを除去→再検証 (通過しても pending_review 行き)
+        from .repair import repair_pass
+
+        n_rep = repair_pass(records, cfg, cache)
+        typer.echo(f"[repair] {n_rep} 本を修復 (元音声は .cache_orig/ に保持。再検証済み)")
     _judge_and_write(records, cfg, out, speaker, cache, mode="run")
 
 
@@ -204,7 +267,7 @@ def rescore(
     ),
     config: str = typer.Option("filters.toml", "--config", help="新しい閾値 filters.toml"),
 ):
-    """E1: 音声処理を再実行せず、manifest.jsonl + 中間キャッシュから閾値再判定だけで納品物を再生成する."""
+    """音声処理を再実行せず、manifest.jsonl + 中間キャッシュから閾値再判定だけで納品物を再生成する."""
     out = Path(data_dir)
     cache = out / ".cache"
     if not (out / "manifest.jsonl").exists():
@@ -218,8 +281,37 @@ def rescore(
         raise typer.Exit(1)
 
     cfg = Config.load(Path(config))
+    _warn_config(cfg, "rescore")
     records = read_manifest(out / "manifest.jsonl")
     typer.echo(f"[rescore] records={len(records)} config={config}")
+    # 旧 manifest の unknown_tokens は死んでいた旧チェックの値。テキストから読みチェックを引き直す
+    n_yomi = refresh_yomi_scores(records)
+    if n_yomi:
+        typer.echo(
+            f"[yomi] 学習側読みチェック (YomiError) 失敗を {n_yomi} 件検出 "
+            "(on_g2p_fail/on_unknown_tokens で判定)"
+        )
+    # 旧 manifest には text_tail_open が無い。テキストから引き直して、再 run なしで
+    # max_text_tail_open を再調整できるようにする (無補正で rescore すると全件「検証不能」で落ちる)
+    n_tail = refresh_text_tail_scores(records)
+    if n_tail:
+        typer.echo(f"[tail] 文末の開き を {n_tail} 件引き直し")
+    # [asr2] を後から有効にしたケース。第 2 ASR は音声を引くしかないが、run だとメイン ASR・
+    # AST・CTC・LM まで全部やり直しになるため、キャッシュから x_cer だけ追加計算する
+    n_x = refresh_asr2_scores(records, cfg, cache)
+    if n_x:
+        typer.echo(f"[asr2] 第 2 ASR クロス検証 (x_cer・読みレベル) を {n_x} 件引き直し")
+    if cfg.thresholds.get("max_x_cer") and not cfg.get("asr2.enabled"):
+        missing = sum(
+            1 for r in records if (r.text or "").strip() and "x_cer" not in (r.scores or {})
+        )
+        if missing:  # 黙って全件「検証不能」で落とさない (run 側の _warn_config と同じ方針)
+            typer.echo(
+                f"warning: max_x_cer 有効なのに [asr2] 無効で {missing} 件に x_cer が無い →"
+                " 該当レコードは検証不能として不合格になります。asr2.enabled=true で自動計算するか"
+                " max_x_cer をコメント-out してください",
+                err=True,
+            )
     _judge_and_write(records, cfg, out, speaker or out.name, cache, mode="rescore")
 
 

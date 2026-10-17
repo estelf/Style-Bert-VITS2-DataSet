@@ -1,9 +1,9 @@
 """Stage 0: 投入・前処理. バイトハッシュ (ストリーミング計算) で同一ファイル再投入を即除外する.
 
-F1/F2: ハッシュはチャンク読み (数 GB の動画で read_bytes() 全展開しない)。
+ハッシュはチャンク読み (数 GB の動画で read_bytes() 全展開しない)。
 デコードは Stage 1 がソース単位で行い、全ソースの波形を同時保持しない。セグメント音声は
 中間キャッシュ (Data/<モデル>/.cache/) に 44.1k flac で書き、以降の Stage はそこから読む
-(E1 の rescore と A3 の納品 raw/ 分離のため、パイプライン中にフル尺波形を常時保持しない)。
+(rescore と納品 raw/ 分離のため、パイプライン中にフル尺波形を常時保持しない)。
 """
 
 from __future__ import annotations
@@ -21,11 +21,11 @@ from .manifest import Record
 @dataclass
 class Source:
     src_hash: str  # sha256[:16] が utt_id の接頭辞になる
-    path: Path  # デコード済み波形は保持しない (F2)。Stage 1 が単位デコードする
+    path: Path  # デコード済み波形は保持しない。Stage 1 が単位デコードする
 
 
 def file_hash(path: Path, chunk_size: int = 1 << 20) -> str:
-    """F1: ストリーミング sha256[:16]."""
+    """ストリーミング sha256[:16]."""
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(chunk_size), b""):
@@ -34,7 +34,7 @@ def file_hash(path: Path, chunk_size: int = 1 << 20) -> str:
 
 
 def decode(path: Path, sr: int) -> np.ndarray:
-    """ffmpeg で 1 回デコード (F6: 44.1k と 16k を 2 回起動しない)."""
+    """ffmpeg で 1 回デコード (44.1k と 16k を 2 回起動しない)."""
     raw = subprocess.run(
         ["ffmpeg", "-v", "error", "-i", str(path), "-f", "f32le", "-ac", "1", "-ar", str(sr), "-"],
         capture_output=True,
@@ -43,8 +43,62 @@ def decode(path: Path, sr: int) -> np.ndarray:
     return np.frombuffer(raw, dtype=np.float32).copy()
 
 
+def probe_duration(path: Path) -> float:
+    """ffprobe で入力尺 (秒) を得る。取得失敗時は 0.0 (呼び出し側で一括デコードに退避)."""
+    try:
+        out = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        return float(out)
+    except (subprocess.SubprocessError, ValueError, OSError):
+        return 0.0
+
+
+def decode_range(path: Path, sr: int, t0: float, dur: float) -> np.ndarray:
+    """[t0, t0+dur] 秒だけデコード (速いシーク + 重なり込みで境界の文を吸収する).
+
+    `-ss` を `-i` より前に置く = キーフレーム基準の高速シーク。音声では誤差が小さい上、
+    前後に重なり込み窓を取っているのでチャンク境界の発話はどちらかのチャンクで必ず取れる。
+    """
+    raw = subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-ss",
+            f"{t0:.3f}",
+            "-t",
+            f"{dur:.3f}",
+            "-i",
+            str(path),
+            "-f",
+            "f32le",
+            "-ac",
+            "1",
+            "-ar",
+            str(sr),
+            "-",
+        ],
+        capture_output=True,
+        check=True,
+    ).stdout
+    return np.frombuffer(raw, dtype=np.float32).copy()
+
+
 def resample_to(x: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
-    """F6/C10: 44.1k 音声から 16k を作って ASR/埋め込みにも渡す (出力音と ASR 入力のズレ防止)."""
+    """44.1k 音声から 16k を作って ASR/埋め込みにも渡す (出力音と ASR 入力のズレ防止)."""
     from math import gcd
 
     if sr_in == sr_out:
