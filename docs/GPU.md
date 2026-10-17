@@ -1,79 +1,55 @@
-# GPU (CUDA) で実行する手順
+# GPU（CUDA）で実行する
 
-既定は CPU wheel 固定（`pyproject.toml` の `pytorch-cpu` index）。GPU マシンでは以下の手順で切り替える。
-切り替えると **Qwen3-ASR（既定 ASR）・SQUIM 品質スコア・faster-whisper（選択時）** が GPU で走る。
+## 既定: uv sync するだけで GPU が使える
 
-## 1. 前提チェック
+`uv.lock` は torch を **CUDA 12.8 版（cu128）** で解決している。
+NVIDIA ドライバが入った Linux マシンでは `uv sync` するだけで GPU が使える。
 
 ```bash
-nvidia-smi   # NVIDIA ドライバが入っていて GPU が見えること
+uv sync
+uv run python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+# 2.11.0+cu128 True
 ```
 
-`nvidia-smi` の `CUDA Version` が 12.8 以上なら cu128 を使う（下表を参照）。
+`torch.cuda.is_available()` が `False` の場合、`uv run make_dataset run <話者>` は自動的に CPU で走る
+（正しさは同じ、速度だけ遅い）。
 
-| nvidia-smi の CUDA Version | 使う index url |
-|---|---|
-| 12.8 以上 | `https://download.pytorch.org/whl/cu128` |
-| 12.6 〜 12.7 | `https://download.pytorch.org/whl/cu126` |
-| それ以下 | ドライバ更新を推奨。古いままなら対応する cuXXX を選ぶ |
+## CPU 運用に戻す（任意）
 
-## 2. pyproject.toml の index を差し替えて再インストール
-
-`pyproject.toml` の末尾にある pytorch-cpu index の url を書き換える:
+GPU ノードと CPU ノードで lock を共有できない場合、`pyproject.toml` の torch インデックスを
+CPU 差し替え、その lock を `uv.lock` としてコミットする。
 
 ```toml
 [[tool.uv.index]]
 name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cu128"   # ← /cpu を /cu128 などへ
+url = "https://download.pytorch.org/whl/cpu"
 explicit = true
-```
 
-そのうえで再解決・再インストール:
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+```
 
 ```bash
 uv lock && uv sync
 ```
 
-## 3. 動作確認
+この差し替えは lock の解決先が変わるだけで、コードの変更は不要。
+`uv.lock` を差し替えた場合は README の「インストール」にその旨を明記する。
 
-```bash
-uv run python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
-# → True <GPU名> と出れば OK
-```
+## 速度の目安
 
-## 4. filters.toml の設定
+| 環境 | 10分音声の目安 |
+|---|---|
+| CPU | 約 10 分 |
+| RTX 4090 | 約 1〜2 分 |
 
-```toml
-[runtime]
-device = "auto"   # 既定値のまま for OK。CUDA があれば自動で cuda。cpu 固定したいなら "cpu"
-```
+`[asr2]`（whisper 二重掛け）と `[alignment]`（forced alignment）を有効にすると ASR 側の時間が増える。
+速度より正確性を落としたい場合は `filters.toml` の `[asr2] enabled = false`、
+`[alignment] enabled = false` で個別に無効化できる。
 
-- **Qwen3-ASR（既定）**: `[runtime] device` に従い、bf16 で GPU に載る。追加設定不要。
-- **faster-whisper を選んだ場合**: `[asr] device = "auto"` のままで GPU 検出される。
-  `compute_type = "int8"` は CPU 量子化なので、cuda のときは実装側で `float16` へ自動切替される
-  （明示したいなら `compute_type = "float16"`）。
-- **SQUIM（Stage 4 品質スコア）**: `[runtime] device` に従う。追加設定不要。
+## 制約
 
-CPU 実行に戻したいときは `[runtime] device = "cpu"` にする（wheel は GPU 版のままでも動く）。
-
-## VRAM の目安とトラブルシューティング
-
-| モデル | 精度 | 目安 VRAM |
-|---|---|---|
-| Qwen/Qwen3-ASR-1.7B-hf | bf16 | 約 4〜5 GB |
-| faster-whisper small | float16 | 約 2 GB |
-| SQUIM_OBJECTIVE | fp32 | ほぼ無視できる |
-
-- **OOM になる**: `[asr] model` を `"Qwen/Qwen3-ASR-0.6B"`（transformers 版が公開されている場合）や
-  faster-whisper `"tiny"` に落とす。他プロセス（ブラウザ等）の VRAM 占有も確認する。
-- **`torch.cuda.is_available()` が False**: 手順 2 の `uv sync` がキャッシュを再利用して CPU wheel のまま
-  になっていないか確認。`uv cache clean torch torchaudio && uv sync` で再取得する。
-- **faster-whisper だけ cuDNN エラー**: ctranslate2 がシステムの cuDNN を要求するケースがある。
-  `uv add nvidia-cudnn-cu12` で解決することが多い（Qwen3-ASR / SQUIM には不要）。
-- **モデルのダウンロード先を変えたい**: `HF_HOME=/path/to/cache` を設定する（既定は `~/.cache/huggingface`）。
-  Qwen3-ASR-1.7B は初回に約 4GB をダウンロードする。
-
-## 補足: rescore は GPU 不要
-
-`make_dataset rescore` は閾値再判定と納品物再生成だけで、音声処理・ASR を再実行しない。
-dedup（MinHash）とレポート生成は CPU で完結するため、GPU 環境の切り替えなしで使える。
+- bf16 前提。非対応 GPU では `filters.toml` の `[asr] torch_dtype = "float32"` にする
+- 初回実行時にモデルをダウンロードする。メイン ASR（Qwen3-ASR）で約 4GB、既定有効の追加機能
+  （tags・LM・alignment）で合計約 3.5GB、asr2（whisper small）で約 0.5GB をキャッシュする
+- CPU 実行時に限らず、モデルのダウンロードはネットワーク越しに一度だけ発生する

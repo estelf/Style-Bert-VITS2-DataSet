@@ -1,7 +1,9 @@
-# パイプライン挙動・閾値の一元管理 (挙動パラメータのデフォルトは src/make_dataset/config.py の DEFAULTS)
-# ここでキーを変えるだけで再生成なしに挙動変更できることが設計上のポイント。
-# E2: 閾値にコード側デフォルトは無い。キーを消せば (またはコメント化すれば) 該当チェックは無効化される。
-#     閾値が有効なのにスコアが取得できない発話は「検証不能=不合格」になる。
+# パイプライン挙動・閾値の一元管理
+#   挙動パラメータのコード側デフォルト: src/make_dataset/config.py の DEFAULTS
+#   閾値 ([thresholds]) のコード側デフォルトは無い — キーを消せば (コメント化すれば) 該当チェックは無効化される
+#   閾値が有効なのにスコアが取得できない発話は「検証不能=不合格」
+#   各設定をその値にした理由・実測・棄却した案: docs/DECISIONS.md (節番号を各項目に付記)
+#   各ステージの処理とゲート対応表: docs/PIPELINE.md / ユースケース別の操作: チートシート.md
 
 [paths]
 # `make_dataset run <話者名>` が音声を取りに行くルート。voice/<話者名>/ に音声・動画をフラット配置すると
@@ -9,34 +11,121 @@
 voice = "voice"
 
 [output]
+# 納品契約 (学習側 preprocess と同じ)。44100 / 1 以外にすると書き出し前に明確なエラーで止まる
 sample_rate = 44100
 channels = 1
-target_lufs = -23.0
+target_lufs = -23.0             # 書き出し時の LUFS 正規化目標 (超過分は -1dBFS ピークリミッタで処理)
 
 [runtime]
-device = "auto"   # "auto" / "cpu" / "cuda"。Qwen3-ASR・SQUIM 等 torch 推論が従う (GPU 手順: docs/GPU.md)
+device = "auto"                 # "auto" / "cpu" / "cuda"。Qwen3-ASR・SQUIM 等 torch 推論が従う (GPU 手順: docs/GPU.md)
 
 [stage1]
-# D4: 「1行=1文」契約を左右するのは speech_pad_ms ではなく silero-vad 側のパラメータ
+# 「1 行=1 文」契約を左右するのは speech_pad_ms ではなく silero-vad 側のパラメータ
 vad_threshold = 0.5
+# 200ms のまま上げるな。350ms に上げると文中切れの回収 26% に対して正常な文境界を 328 箇所融合する
+# (実測: 文中切れ 1.7%、分割地点の実無音 p50=0.76s。docs/DECISIONS.md 2.3)
 min_silence_duration_ms = 200
 min_speech_duration_ms = 250
-max_speech_duration_s = 12.0   # D3: 長い塊は破棄せず VAD 側で 12s で分割 (発話長ゲート <12s と揃える)
-speech_pad_ms = 0              # C11: 既定はパディングなし (出力は音声境界そのまま。ASR 文脈用に上げる場合のみ)
-refine_window_ms = 70          # 境界補正窓 (C8: 始端/終端それぞれ話声の実境界へ。語尾は切らない)
-min_seg_sec = 0.5              # これより短い VAD 出力はスキップ (閾値ゲート min_seg_sec と揃える)
+max_speech_duration_s = 12.0    # 長い塊は破棄せず VAD 側で 12s で分割 (発話長ゲート max_seg_sec と揃える)
+speech_pad_ms = 0               # VAD 側の切り出しを前後へ広げるだけ。境界補正窓 (refine_window_ms) 以内の分は
+                                #   トリムされて出力に残らない。納品音声のマージンは下の output_pad_ms を使う
+refine_window_ms = 70           # 境界補正窓 (始端=最初の話声フレーム / 終端=最後の話声フレームへ。語頭・語尾は削らない)
+output_pad_ms = 20              # 境界補正の**後**に効く納品用の無音マージン [ms]。0 で無効。
+                                #   語頭無音 10ms 未満が話者の 3〜6 割に張り付きメロスぺクトル窓際が欠けるため付与
+                                #   (実測 48%→17%。分割地点の実無音 200ms より十分小さい値に置く。docs/DECISIONS.md 2.6)
+cache_min_sec = 0.2             # 中間キャッシュする物理下限。未満の VAD 出力は音声を作らず manifest に too_short だけ残す
+                                #   採用/除外は閾値 min_seg_sec が決める (rescore で緩められるよう分離)
+decode_chunk_min = 10.0         # 長尺ソースをこの分数に分割してデコード (1 本の長尺動画でラン全体が OOM するのを防ぐ)。0 で無効=一括デコード
 
 [asr]
-backend = "qwen3-asr"  # 既定: Qwen3-ASR (高精度)。"faster-whisper" は CPU 軽量代替 (model は "small"/"tiny" 等のサイズ名)
+backend = "qwen3-asr"           # 既定: Qwen3-ASR (高精度)。"faster-whisper" は CPU 軽量代替 (model は "small"/"tiny" 等のサイズ名)
 model = "Qwen/Qwen3-ASR-1.7B-hf"  # qwen3-asr 時は HF リポジトリID。faster-whisper 時は Whisper サイズ名
-compute_type = "int8"  # faster-whisper のみ。device が cuda のときは float16 へ自動切替
-device = "auto"        # "auto" なら runtime.device に従う
+compute_type = "int8"           # faster-whisper のみ。device が cuda のときは float16 へ自動切替
+device = "auto"                 # "auto" なら runtime.device に従う
 language = "ja"
-beam_size = 1          # faster-whisper のみ
-batch_size = 8         # faster-whisper のみ (対応版ならデコード窓のバッチ並列へ渡す)
+beam_size = 1                   # faster-whisper のみ
+batch_size = 8                  # faster-whisper のみ (対応版ならデコード窓のバッチ並列へ渡す)
+
+[asr2]
+# 第 2 ASR とのクロス検証。メインとは**別系統**を走らせ、2 系統間 CER を x_cer に記録する。
+# x_cer は表層文字でなく**読みレベル** (pyopenjtalk の g2p でカタカナ化) で取る。表層値は x_cer_surface。
+#   実測: 表層比較は中央値 0.11・完全一致 1% (whisper は句読点を打たない・同音異字になる)。
+#         読み化すると中央値 0.00・完全一致 7 割超。表層でゲートを締めると正常発話を大量に落とす。
+#   実行コスト 0.1〜0.3 秒/本。run 済みデータセットへの後付けは rescore で足りる
+#   (第 2 ASR だけキャッシュから引き直す。同じ x_cer_algo 版数のレコードは再計算しないので、
+#    閾値の締め直しだけの rescore は第 2 ASR を走らせない。詳細: docs/DECISIONS.md 3.7)
+enabled = true
+backend = "faster-whisper"      # メイン (qwen3-asr) とは違う系統にすること。同じ backend+model だと起動時に警告
+model = "small"
+compute_type = "int8"
+device = "auto"
+language = "ja"
+beam_size = 1
+batch_size = 8
+
+[stage4]
+# SQUIM_SUBJECTIVE の総合 MOS を mos として記録 (pesq と別軸)。初回に約 360MB をダウンロード。
+# 参照音声アンカーに SNR 最良の発話を使うため、mos は**その話者自身の最クリーン発話に対する相対品質**
+# (絶対 MOS ではない)。min_mos を締める前に実測分布を見ること。docs/DECISIONS.md 4.4
+subjective = false
+
+[tags]
+# AudioSet タグ付け (AST)。音楽・笑い・咳・拍手などを**音声から直接**検出し tag_hit に記録
+# (music_flag は ASR が ♪ を吐くかに依存していた)。初回に約 1.3GB をダウンロード。
+# 判定 reject_audio_tags は既定有効。検出対象は reject の AudioSet クラス名で増減する。
+enabled = true
+model = "MIT/ast-finetuned-audioset-10-10-0.4593"
+min_prob = 0.25                 # この確率以上のタグをヒットとみなす
+reject = ["Music", "Musical instrument", "Singing", "Laughter", "Applause", "Cheering",
+          "Cough", "Sneeze", "Crying, sobbing", "Baby cry, infant cry",
+          "Alarm", "Siren", "Telephone", "Beep, bleep"]
+
+[overlap]
+# pyannote segmentation-3.0 で 2 人同時発話 (overlap_flag / overlap_sec) を検出する。
+# 任意依存: `uv sync --extra extras` + HF_TOKEN (pyannote モデルの利用規約同意が必要)。
+# 判定は [thresholds] reject_overlap (コメント解除)。無効の間は overlap_flag=None のまま素通り。
+enabled = false
+model = "pyannote/segmentation-3.0"
+# token = "hf_..."             # 省略時は環境変数 HF_TOKEN
+min_overlap_sec = 0.2           # これ以上の重複秒がある発話をフラグ
+
+[alignment]
+# CTC 強制アライメント (Common Voice 日本語で学習した文字語彙 CTC ASR)。
+# ctc_align_score (text↔audio の実一致。実測分離 一致 0.76 / 別テキスト 0.00) と
+# unaligned_edge_ratio (先頭/末尾の「テキストに無い発話」比 = 2文混入・境界ズレ) を記録。初回に約 1.2GB。
+# **ゲートには使わず記録のみ**: 短文で構造的に下がり、落ちた分の品質が採用群と同水準だった
+# (実測検証の内容と再検証手順は [thresholds] の min_ctc_align / max_unaligned_edge のコメントと
+#  docs/DECISIONS.md 4.1)。境界ズレの検出は x_cer に期待する。
+enabled = true
+model = "jonatasgrosman/wav2vec2-large-xlsr-53-japanese"
+
+[lm]
+# MLM 擬似パープレキシティ (ku-nlp DeBERTa-v2 char-wwm)。発音が変わる誤変換は文としても不自然になる
+# という前提で lm_ppl を記録。初回に約 1GB をダウンロード。同音異字 (発音が同じ誤変換) は無害なので上げない。
+# 注: bert-japanese 系に差し替えると char 版でも MeCab (fugashi+unidic) が必要になる。docs/DECISIONS.md 4.2
+enabled = true
+model = "ku-nlp/deberta-v2-large-japanese-char-wwm"
+
+[text]
+# ASR 出力の記号 (% ℃ ㎡ 等) を日本語読みへ展開してから G2P にかける (itn.py の対応表)。
+# 展開後も残る記号は residual_symbols として記録 (max_residual_symbols ゲートで弾ける)。
+symbol_readings = true
+
+[repair]
+# DeepFilterNet 除去修復。targets に挙げたゲート**単独**で落ちた発話だけノイズ除去し、
+# 音響/品質スコアを引き直す。通過しても自動採用せず pending_review 行き
+# (除去アーティファクトを機械の自己申告で通さない)。元音声は .cache_orig/ に保持される。
+# 導入: deepfilternet は numpy<2 pins のため lock 外。
+#   `uv pip install --no-deps deepfilternet deepfilterlib loguru appdirs requests sympy`
+#   (--no-deps なしだとプロジェクトの numpy 2.x を downgrade して壊す)。numpy 2 非互換の場合は無効に戻す。
+enabled = false
+backend = "deepfilternet"
+targets = ["min_snr_db", "min_quality_pesq", "min_stoi", "min_si_sdr"]
 
 [thresholds]
-# 既定値は test/asset/ の実測分布で校正済み (C6 で再校正)。キーを消せば該当チェックは無効化される。
+# キーを消せば該当チェックは無効化される (コード側デフォルト無し)。既定値は実コーパスの実測分布で校正済み。
+# 「検証不能=不合格」: 対応プロバイダを有効にした run の後に限りゲートをコメント解除できる
+# ([asr2] だけ例外。rescore が .cache から x_cer を追加計算する)。
 min_seg_sec = 0.5              # 発話長ゲート: 0.5 秒以上 (満たないものは除外)
 max_seg_sec = 12.0             # 発話長ゲート: 12 秒未満 (12.0 以上は除外。VAD 側も 12s で分割する)
 min_snr_db = 5.0
@@ -44,30 +133,104 @@ min_asr_conf = 0.30
 min_align_conf = 0.30
 min_mora_rate = 2.0
 max_mora_rate = 14.0
-max_mora_rate_dev = 1.2        # C5: 話速の話者中央値からの相対乖離 (2文混入・ASR欠落・ガチャ)
-min_hf_energy_ratio = 0.0005   # 7kHz 以上エネルギー比 (16k/24k アップコン見せかけ品質の検出。実測 p5≈0.001)
+max_mora_rate_dev = 1.2        # 話速の話者中央値からの相対乖離 (2文混入・ASR欠落・ガチャ)
+min_hf_energy_ratio = 0.0005   # 7kHz 以上エネルギー比 (16k/24k アップコン見せかけ品質。実測 p5≈0.001)
 # min_rolloff_hz = 7500.0      # ロールオフ単体は音量の低い文で誤爆するためゲート既定値なし
 max_reverb_score = 0.5
-min_quality_pesq = 1.5         # C6: 1.0 は PESQ スケールの下限値そのもので実質 no-op だった。実測分布を見て締める
+min_quality_pesq = 1.5         # 1.0 は PESQ スケールの下限値そのもので実質 no-op だった。実測分布を見て締める
 min_chars = 4
-max_filler_ratio = 0.6         # C6: 0.8 は甘すぎた
-max_jitter_local = 0.02        # C3 修正 (有声区間内の Praat local 定義) に合わせて 0.5 → 0.02
-# max_shimmer_local = 0.05     # C3 修正済み。実測分布を確認して有効化
-min_speaker_sim = 0.5          # C5: CMVN 済み埋め込みの centroid cosine (別人混入)。実測分布で要校正
-min_kana_ratio = 0.5           # C5: 日本語らしさ (英語・記号化テキストの検出)
-# min_f0_hz / max_f0_hz        # 話者依存の帯域なのでデータセットごとに設定する (例: min_f0_hz = 120.0)
-max_clip_ratio = 0.002         # D2: クリッピング率 (学習後に修復不可能)
-max_dc_offset = 0.02           # D2: DC オフセット絶対値
-# max_no_speech_prob = 0.8     # D1: 「無声区間だと ASR が言っている」= ハルシネーション (faster-whisper 専用スコア)。
+max_filler_ratio = 0.6         # 0.8 は甘すぎた (filler_ratio は出現回数ベース)
+max_jitter_local = 0.02        # jitter を有声区間内の Praat local 定義に修正したのに合わせて 0.5 → 0.02
+# max_shimmer_local = 0.05     # shimmer も別計算に修正済み。実測分布を確認して有効化
+min_speaker_sim = 0.5          # CMVN 済み埋め込みの主話者 centroid と cosine (別人混入)。実測分布で要校正
+min_kana_ratio = 0.5           # 日本語らしさ (英語・記号化テキストの検出)。分母は かな+英数字 のみ
+max_clip_ratio = 0.002         # クリッピング率 (学習後に修復不可能)
+max_dc_offset = 0.02           # DC オフセット絶対値
+max_digital_silence = 0.5      # デジタル無音サンプル率の上限 (無音スライス混入。高価値で低リスクなので既定有効)
+min_voiced_ratio = 0.1         # 有声フレーム率の下限 (ノイズ/換気/咳のみの発話。低めの安全側で既定有効)
+# min_f0_hz = 120.0            # 話者依存の帯域なのでデータセットごとに設定 (異常に低いピッチ)
+# max_f0_hz = 400.0            # 異常に高いピッチ (叫び・子供声混入)
+# min_stoi = 0.6               # 明瞭度 (SQUIM。pesq と別軸)。実測分布を見て有効化
+# min_si_sdr = 5.0             # 分離度 (SQUIM)
+# min_input_lufs = -35.0       # 極端に小さい入力 (LUFS 正規化でノイズ床も持ち上げるのを防ぐ)
+# reject_overlap = true        # 2人同時発話 ([overlap] を有効にした run の後にコメント解除)
+# max_no_speech_prob = 0.8     # 「無声区間だと ASR が言っている」= ハルシネーション (faster-whisper 専用)。
 #                              #   qwen3-asr を使っている間に有効にすると欠損スコア=全件不合格になるので注意
-# max_compression_ratio = 2.4  # D1: 繰り返しガチャ (whisper 本体のしきい値と揃えた)。同上 faster-whisper 専用
-reject_repetition = true       # D1: 同一文言 3 連呼以上のブロック (バックエンド非依存で検出)
-reject_alpha_only = true       # E4: アルファベットのみ (filler_ratio とは別理由で記録)
-reject_music = true            # D5: ♪ 検出 = 音楽だと判定した発話
-on_g2p_fail = "exclude"        # E3: G2P が通らないテキストの扱い ("exclude" / "dict_data")
-on_unknown_tokens = "dict_data"  # E3: unknown トークンはユーザー辞書候補へ (status=pending_review でレポートに出る)
+# max_compression_ratio = 2.4  # 繰り返しガチャ (whisper 本体のしきい値と揃えた)。同上 faster-whisper 専用
+reject_repetition = true       # 同一文言 3 連呼以上のブロック (バックエンド非依存で検出)
+reject_alpha_only = true       # アルファベットのみ (filler_ratio とは別理由で記録)
+reject_music = true            # ♪ 検出 = 音楽だと判定した発話
+on_g2p_fail = "exclude"        # G2P が通らないテキストの扱い ("exclude" / "dict_data"=pending_review)。
+                               #   学習側の読みチェック (YomiError) 失敗も含む (yomi.py が学習側と同じ条件を事前打診)
+on_unknown_tokens = "exclude"  # unknown トークンの扱い ("exclude" / "dict_data"=pending_review)。
+                               #   unknown = 学習側で読めない語 (pron=「、」。希少漢字・古いカタカナ等) の数。
+                               #   読めない語を含むデータは既定で不採用 (納品しても学習側 preprocess で落ちるため
+                               #   旧 "adopt" オプションは削除)。読めない語は yomi_bad_words に残り
+                               #   report.html の「読めない語」に出る (ユーザー辞書登録の決定材料)
+# --- 追加検証軸のゲート (対応するプロバイダセクションを有効にした run の後に、実測分布を見て締める) ---
+# 同梱 filters.toml の既定: [asr2] / [tags] / [lm] / [alignment] が有効 (初回ダウンロード合計 約 3.5GB)。
+# ゲートは max_x_cer / reject_audio_tags / max_lm_ppl (いずれも除外) のみ既定有効 = 完全自動運用。
+max_x_cer = 0.45               # 2 系統 ASR 間の読みレベル CER (不一致 = どちらかが誤認識)。
+                               #   実測 (6 話者 10,369 候補 / 採用 3,525 件、Qwen3-ASR ⇄ whisper small):
+                               #   採用内の超過率 0.3→2.9% / 0.4→1.5% / 0.45→1.25% / 0.5→0.8%。
+                               #   旧ゲート脱落群は 0.3 で 42.9% = 15 倍の濃度差。CTC での自動裁定は不能
+                               #   (主 ASR 支持 38% / whisper 支持 29% / 判定不能 33%) なので、
+                               #   「片方が明らかに壊れている」0.45 だけで除外し境界帯は人が選べるようにした
+                               #   (適用結果 3,525 → 3,486 件。詳細は docs/DECISIONS.md 3.7)
+                               #   締め直しは rescore 数秒 (x_cer は manifest にキャッシュ済み。第 2 ASR は走らない)
+# review_x_cer = 0.25          # 除外より一段柔らかい受け皿 (超過は除外でなく pending_review 行き)。
+                               #   0.25 で採用の約 4% が見送り行き。report.html の「見送り」に第 2 系統の出力と
+                               #   並べて出るので、text_overrides.jsonl に本文を書けば採用に戻せる
+min_token_prob = 0.25          # トークン確率の最小値。平均が高くても 1 語だけ怪しい聞き間違いを拾う。
+                               #   実測 (採用内 p1=0.26 / p5=0.43 / p25=0.68): 0.25 は採用 0.8%・全候補 1.7% を切る
+                               #   末尾カット。旧コメント値 0.30 は採用 1.7% を落としていた
+max_token_nll = 0.3            # 平均負対数尤度 (トークン確率分布全体の信頼度)。
+                               #   実測: 採用内 p25=0.003 / 中央値 0.011〜0.025 / p95=0.11〜0.18。
+                               #   0.3 で採用 0.5%・全候補 5.0% を切る。旧コメント値 3.0 は 10 桁違いの no-op だった
+reject_audio_tags = true       # AudioSet タグヒット (音楽/笑い/咳を音声から直接検出)。[tags] 既定有効のため即動作。
+                               #   注意: tag_hit を持たない旧 manifest への rescore では全件「検証不能=不合格」になる
+# min_mos = 3.0                # SQUIM_SUBJECTIVE の MOS (pesq と別軸。同一話者の最クリーン発話に対する相対値)。
+                               #   [stage4] subjective=true が必要
+# min_ctc_align / max_unaligned_edge は「音声↔テキストの実一致」を見る有力候補として実測検証したが、
+# 6 話者 10,369 候補 + 別系統 ASR (faster-whisper small) との突き合わせで **ゲート化は取りやめ** (記録のみ)。
+#   ① 発話長に強く従属する (スコア自体が 1/T 依存): 0.15 で旧採用からの脱落が <1s 13.6% / 1-2s 4.3% /
+#      2-3s 0.8% / 3-5s 0.5%。edge 0.5 は <1s で 8.8%、2s 以上で 0%。短文は枠数が小さく 1 枠の誤差が効く
+#   ② 落ちた側の品質が採用群と変わらない: ctc 単独脱落の whisper 一致率 67% / edge 単独 80% /
+#      対照 (採用のまま) 78%。ctc=0.0 の「ゆっくり息を吸って。」「グリグリ。」「くるくる。」、
+#      edge=0.737 の「どうぞ。」(1.16s) を whisper も本文と同一に聴いた = CTC モデル側のアライメント失敗
+#   ③ 旧コメント値はさらに悪く、min_ctc_align 0.5 は採用の 18.3%、max_unaligned_edge 0.25 は 21.1% を落とす
+# 2 文混入・境界ズレの実質的な検出は x_cer (読みレベルの 2 系統不一致) に期待する (上の max_x_cer)
+# min_ctc_align = 0.15         # CTC 強制アライメントの経路平均後部確率。[alignment] 既定有効で記録のみ
+# max_unaligned_edge = 0.5     # 先頭/末尾の「テキストに無い発話」比。同上 (report.html で分布を確認できる)
+max_lm_ppl = 200.0             # MLM 擬似 PPL (文脈的に不自然な文字起こしを**除外**)。[lm] 既定有効。
+                               #   実測分布 (1688 件): adopted p95≈59。100-200 帯は短文口語断片 (「どうしたの。」「じゃあ。」)
+                               #   が中心で採用可、>200 に同音異字疑似 (氷柱/兵衆/悲願花) が寄る。もっと詰めるなら 100
+# review_lm_ppl = 100.0        # max_lm_ppl より柔らかい受け皿 (超過は pending_review 行き)。
+                               #   完全自動優先でコメント-out。受け皿が要る時だけ解除すると、report.html の
+                               #   「見送り」に lm_ppl と本文が出る (確定は text_overrides.jsonl の status で行う)
+# max_residual_symbols = 0     # 記号読み上げ展開 ([text]) を使っても残る記号の数 (G2P リスク)
+max_text_tail_open = 1         # 文末の開きの許容度。text_tail_open は
+                               #   0=文として閉じている / 1=言い淀み止め (条件節「〜したら。」・連用形中止「〜だし。」・
+                               #     連体止め「〜ような。」。演技上の言い淀みとして成立する) /
+                               #   2=途中で切れている (文末記号すらない / 動詞語幹が促音で止まる「〜混じっ」)。
+                               #   既定 1 = 2 だけ落とす。実コーパス 3,539 件での分布: 0=3,464 / 1=74 (2.1%) / 2=1。
+                               #   言い淀みまで落として文が完結するものだけ残したいなら 0 にする (rescore で再調整可)。
+                               #   助詞止め (「今から。」) は口語の普通形なので検出しない (34% が該当してしまうため)
 
 [dedup]
 text_jaccard = 0.92
 phoneme_jaccard = 0.90
-audio_jaccard = 0.5            # D8: 音声内容指紋 (fp_sig MinHash 一致率)。ズレ切り出し重複は 0.6 前後、別発話は 0.2 未満
+audio_jaccard = 0.5            # 音声内容指紋 (fp_sig MinHash 一致率)。ズレ切り出し重複は 0.6 前後、別発話は 0.2 未満
+
+[diversity]
+# 重複排除の後に残り、貪欲選択して「既採用と類似しすぎる発話」を落とす (データセットの多様性を上げる)。
+# 採用集合の総対ペア類似度を sim_threshold 未満に抑える。rescore で metric / 閾値を再調整できる (再計算不要)。
+enabled = true
+metric = "phoneme"             # 内容の近さで測る: phoneme(音素三量文字列 Jaccard, 既定) / text(shingle) / audio(内容指紋 fp_sig 一致率)。話者/音響の emb は単一話者で別内容まで間引くため不採用
+sim_threshold = 0.6            # 実測: 別々の発話は音素三量 Jaccard ≤0.05、似た内容は ~0.67、完全一致 ~1.0。0.6 は「似た内容」だけを間引き別発話には触れない。dedup(0.90) より緩く、dedup 閾値未満に置く
+protect_coverage = true        # ある音素の唯一の供給源は similar / cap / target_size のいずれでも落とさない (音素カバレッジ保護)
+# --- 追加ノブ (既定 0 = 無効 = 従来の「品質順+類似間引き」と同動作。report.html に選別前後の多様性メトリクスが出る) ---
+gain_lambda = 0.0              # 選択スコア = 品質順位 + λ×(新規音素 three-gram 利得)。多様性を「間引き」でなく「最大化」に切り替える。target_count との併用で K 本の多様性最大化選択
+max_bucket_share = 0.0         # 韻律バケット (F0 三分位 × 話速三分位) ありの最大採用シェア (例 0.4)。読み上げ調などへの偏りを整流化。F0/話速が計測不能な発話は免除
+max_source_share = 0.0         # 投入ソース 1 本の最大採用シェア (例 0.5)。長尺動画 1 本にスタイルを引きずられるのを防ぐ
+target_count = 0               # 目標本数に達したら選択を打ち切る (残りは target_count 超過分として target_size で除外)
