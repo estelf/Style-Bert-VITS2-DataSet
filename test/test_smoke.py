@@ -88,19 +88,19 @@ def test_smoke_pipeline_one_pass(tmp_path, monkeypatch):
         )  # LUFS 正規化が効いていて実際に鳴る音量であること (全ゼロ回帰の検知)
         import numpy as np
 
-        assert np.isfinite(data).all()  # A1: nan/inf が混じっていない
+        assert np.isfinite(data).all()  # nan/inf が混じっていない
 
-    # E5: 再現性メタデータ
+    # 再現性メタデータ
     import json
 
     meta = json.loads((out / "run.json").read_text(encoding="utf-8"))
     assert meta["mode"] == "run" and "thresholds" in meta["config"]
 
-    # A2: manifest.jsonl は厳密な JSON として読み直せる (NaN/-Infinity の混入なし)
+    # manifest.jsonl は厳密な JSON として読み直せる (NaN/-Infinity の混入なし)
     for line in (out / "manifest.jsonl").read_text(encoding="utf-8").splitlines():
         json.loads(line)
 
-    # A3: 2回目の実行でも前回除外済みファイルが raw.zip に混入しない (件数が esd.list と一致し続ける)
+    # 2回目の実行でも前回除外済みファイルが raw.zip に混入しない (件数が esd.list と一致し続ける)
     res = CliRunner().invoke(
         app,
         ["run", "test", "--config", str(cfg), "--outdir", str(tmp_path / "Data")],
@@ -110,7 +110,7 @@ def test_smoke_pipeline_one_pass(tmp_path, monkeypatch):
     with zipfile.ZipFile(out / "raw.zip") as z:
         assert len(z.namelist()) == len(lines2)
 
-    # E1: rescore — 閾値を変えて manifest 再生成だけで再判定できる (DESIGN テスト方針)
+    # rescore — 閾値を変えて manifest 再生成だけで再判定できる (DESIGN テスト方針)
     strict = tmp_path / "strict.toml"
     strict.write_text('[asr]\nmodel = "tiny"\n[thresholds]\nmin_chars = 999\n')
     res = CliRunner().invoke(app, ["rescore", str(out), "--config", str(strict)])

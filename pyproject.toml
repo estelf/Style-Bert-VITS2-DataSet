@@ -21,8 +21,7 @@ dependencies = [
     "tqdm",
 ]
 
-# F7: 既定は CPU wheel 固定 (pytorch-cpu index)。GPU で使う場合は下の index url を
-# https://download.pytorch.org/whl/cu128 などへ差し替えて `uv lock && uv sync` する
+# GPU（CUDA 12.8）運用が既定。CPU 運用に戻す手順は docs/GPU.md
 # (torch を optional-dependencies へ分離すると既定の `uv sync` で torch が消えて壊れるため、
 #  index 差し替え手順を明示する形にしている)。
 [tool.uv.sources]
@@ -36,6 +35,13 @@ explicit = true
 
 [project.scripts]
 make_dataset = "make_dataset.cli:main"
+
+# 任意機能は lazy import + filters.toml でオプトイン (既定の uv sync では入らない):
+#   pyannote.audio — B3 2人同時発話検出 ([overlap]。pyannote モデルの利用規約同意 + HF_TOKEN が必要)
+# 注: B8 の deepfilternet は numpy<2 を要求するため本プロジェクト (numpy 2.x / librosa>=1.0) の
+#     lock には入れられない。有効化時の導入手順は filters.toml [repair] と README を参照 (--no-deps)。
+[project.optional-dependencies]
+extras = ["pyannote.audio>=3.1"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/make_dataset"]
